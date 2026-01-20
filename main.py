@@ -3574,4 +3574,5 @@ def main(page: ft.Page):
     show_view(show_home)
 
 if __name__ == "__main__":
-    ft.run(main)
+
+    ft.app(target=main, assets_dir="assets")
