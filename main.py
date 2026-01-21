@@ -1,16 +1,27 @@
 import csv
+import mimetypes
 import io
 import json
 import re
-import threading
+try:
+    import threading
+except Exception:
+    threading = None
 import unicodedata
 import flet as ft
 from datetime import datetime, timedelta
 import os
 import tempfile
 from pathlib import Path
-import webbrowser
+try:
+    import webbrowser
+except Exception:
+    webbrowser = None
 from typing import Dict, List, Optional, Any
+
+# Fix MIME types for web (mjs/wasm)
+mimetypes.add_type("application/javascript", ".mjs")
+mimetypes.add_type("application/wasm", ".wasm")
 
 # ============ STORAGE SERVICE ============
 class StorageService:
@@ -20,6 +31,14 @@ class StorageService:
         self.page = page
         self.is_web = page.web if hasattr(page, 'web') else False
         self.storage_key = "npic_memory_dates_data"
+        # Storage compatible con distintas plataformas/versions
+        self._storage = None
+        if self.is_web:
+            for attr in ("client_storage", "storage", "session_storage"):
+                candidate = getattr(self.page, attr, None)
+                if candidate is not None:
+                    self._storage = candidate
+                    break
         self.data: Dict[str, Any] = {
             "equipos": [],
             "mantenimientos": [],
@@ -31,11 +50,14 @@ class StorageService:
         try:
             if self.is_web:
                 # Modo web: usar client_storage
-                stored = self.page.client_storage.get(self.storage_key)
-                if stored:
-                    self.data = json.loads(stored)
-                else:
+                if self._storage is None:
                     self._initialize_default_data()
+                else:
+                    stored = self._storage.get(self.storage_key)
+                    if stored:
+                        self.data = json.loads(stored)
+                    else:
+                        self._initialize_default_data()
             else:
                 # Modo desktop/móvil: usar archivo JSON
                 try:
@@ -61,7 +83,11 @@ class StorageService:
         try:
             if self.is_web:
                 # Modo web: usar client_storage
-                self.page.client_storage.set(self.storage_key, json.dumps(self.data))
+                if self._storage is not None:
+                    self._storage.set(self.storage_key, json.dumps(self.data))
+                else:
+                    # Sin storage disponible: mantener en memoria
+                    pass
             else:
                 # Modo desktop/móvil: guardar en archivo JSON
                 docs_dir = Path.home() / "Documents" / "NPICMemoryDates"
@@ -503,11 +529,14 @@ class StorageService:
             return False
 
 def main(page: ft.Page):
+    is_web = page.web if hasattr(page, "web") else False
+
     page.title = "NPIC Memory Dates"
-    page.window_width = 900
-    page.window_height = 700
-    page.window_min_width = 300
-    page.window_min_height = 500
+    if not is_web:
+        page.window_width = 900
+        page.window_height = 700
+        page.window_min_width = 300
+        page.window_min_height = 500
     page.padding = 12
     page.bgcolor = "#121821"
     page.scroll = ft.ScrollMode.ALWAYS
@@ -518,11 +547,25 @@ def main(page: ft.Page):
     
     # Inicializar servicio de almacenamiento
     storage = StorageService(page)
-    storage.load()
+    try:
+        storage.load()
+    except Exception as e:
+        print(f"Error cargando storage: {e}")
+        storage._initialize_default_data()
     
     # Detectar plataforma
     is_web = storage.is_web
-    is_mobile = page.window_width < 600 if page.window_width else False
+
+    def get_page_width():
+        if not is_web:
+            return getattr(page, "window_width", None)
+        return getattr(page, "width", None)
+
+    def is_narrow_screen():
+        width = get_page_width()
+        return width is not None and width < 600
+
+    is_mobile = is_narrow_screen()
     
     # Colores (se podrán cambiar con el modo claro/oscuro)
     CARD = "#1B2430"
@@ -675,8 +718,6 @@ def main(page: ft.Page):
             print(f"Error importando: {e}")
             return False
 
-        return "\n".join(lineas)
-
     def construir_csv_historial(historial):
         buffer = io.StringIO()
         writer = csv.writer(buffer)
@@ -685,6 +726,77 @@ def main(page: ft.Page):
             for fecha in historial[nombre]:
                 writer.writerow([nombre, fecha])
         return buffer.getvalue().strip()
+
+    def construir_html_historial(historial, fecha_desde=None, fecha_hasta=None):
+        """Construye un HTML con el historial de mantenimientos."""
+        html = """<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Historial de Mantenimientos</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        h1 { color: #333; }
+        table { border-collapse: collapse; width: 100%; margin-top: 20px; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #4FC3F7; color: white; }
+        tr:nth-child(even) { background-color: #f2f2f2; }
+    </style>
+</head>
+<body>
+    <h1>📚 Historial de Mantenimientos</h1>
+"""
+        if fecha_desde and fecha_hasta:
+            html += f"<p><strong>Periodo:</strong> {fecha_desde} a {fecha_hasta}</p>\n"
+        else:
+            html += "<p><strong>Periodo:</strong> Últimos 24 meses</p>\n"
+        
+        html += """    <table>
+        <thead>
+            <tr>
+                <th>Equipo</th>
+                <th>Fechas</th>
+                <th>Total</th>
+            </tr>
+        </thead>
+        <tbody>
+"""
+        for nombre in sorted(historial.keys()):
+            fechas = historial[nombre]
+            fecha_texto = ", ".join(fechas)
+            html += f"""            <tr>
+                <td>{nombre}</td>
+                <td>{fecha_texto}</td>
+                <td>{len(fechas)}</td>
+            </tr>
+"""
+        html += """        </tbody>
+    </table>
+</body>
+</html>"""
+        return html
+
+    def guardar_historial_en_archivo(nombre_archivo, contenido, ruta_destino=None):
+        """Guarda el historial en un archivo (solo desktop/móvil)."""
+        if is_web:
+            return None  # En web no guardamos archivos locales
+        
+        try:
+            if ruta_destino:
+                file_path = Path(ruta_destino) / nombre_archivo
+            else:
+                docs_dir = Path.home() / "Documents" / "NPICMemoryDates" / "historial"
+                docs_dir.mkdir(parents=True, exist_ok=True)
+                file_path = docs_dir / nombre_archivo
+            
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(contenido)
+            
+            return str(file_path)
+        except Exception as e:
+            print(f"Error guardando historial: {e}")
+            return None
 
     def generar_historial_mantenimientos(
         fecha_desde=None,
@@ -861,6 +973,14 @@ def main(page: ft.Page):
             temp_path = os.path.join(temp_dir, f"npic_historial_{timestamp}.html")
             with open(temp_path, "w", encoding="utf-8") as f:
                 f.write(contenido)
+            if webbrowser is None:
+                page.snack_bar = ft.SnackBar(
+                    content=ft.Text("No se puede abrir el navegador en este entorno"),
+                    bgcolor=ORANGE,
+                )
+                page.snack_bar.open = True
+                page.update()
+                return
             webbrowser.open(Path(temp_path).as_uri())
             page.snack_bar = ft.SnackBar(
                 content=ft.Text("Historial abierto; usa Imprimir en el navegador"),
@@ -1532,7 +1652,7 @@ def main(page: ft.Page):
                         padding=20,
                         border_radius=15,
                         border=ft.Border.all(3, ACCENT),
-                        width=min(500, page.window_width - 40) if page.window_width else 500,
+                        width=min(500, get_page_width() - 40) if get_page_width() and get_page_width() > 40 else 500,
                     )
                 ],
                 expand=True,
@@ -2323,6 +2443,22 @@ def main(page: ft.Page):
             show_view(show_home)
 
         def close_app(e):
+            if is_web:
+                page.snack_bar = ft.SnackBar(
+                    content=ft.Text("Esta acción no está disponible en la versión web"),
+                    bgcolor=ORANGE,
+                )
+                page.snack_bar.open = True
+                page.update()
+                return
+            if threading is None:
+                page.snack_bar = ft.SnackBar(
+                    content=ft.Text("No se puede cerrar la app en este entorno"),
+                    bgcolor=ORANGE,
+                )
+                page.snack_bar.open = True
+                page.update()
+                return
             try:
                 if e and getattr(e, "control", None):
                     e.control.disabled = True
@@ -2400,7 +2536,7 @@ def main(page: ft.Page):
         )
         
         # Añadir FAB (Floating Action Button) para facilitar navegación en móvil
-        if is_mobile or page.window_width < 600:
+        if is_narrow_screen():
             page.floating_action_button = ft.FloatingActionButton(
                 icon=ft.icons.ARROW_BACK,
                 bgcolor=ACCENT,
@@ -3571,8 +3707,17 @@ def main(page: ft.Page):
     
     # ============ INICIO ============
     # Base de datos inicializada mediante StorageService (sin SQLite)
-    show_view(show_home)
+    try:
+        show_view(show_home)
+    except Exception as e:
+        print(f"Error en show_home: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
-
-    ft.app(target=main, assets_dir="assets")
+    ft.run(
+        main,
+        assets_dir="assets",
+        web_renderer=ft.WebRenderer.AUTO,
+        route_url_strategy=ft.RouteUrlStrategy.HASH,
+    )
